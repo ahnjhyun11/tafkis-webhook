@@ -38,29 +38,45 @@ def get_krx_close(ticker):
         return []
 
 def get_binance_close(symbol):
+    # Railway US West에서 api.binance.com 차단 -> data-api.binance.vision 우회 + Bybit fallback
+    endpoints = [
+        f"https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval=1d&limit=250",
+        f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1d&limit=250",
+    ]
+    for url in endpoints:
+        try:
+            resp = requests.get(url, timeout=15)
+            data = resp.json()
+            # data가 리스트여야 정상
+            if isinstance(data, list) and len(data) > 100:
+                closes = [float(k[4]) for k in data]
+                print(f"{symbol} from {url} ok {len(closes)}")
+                return closes
+            else:
+                print(f"{symbol} {url} returned {data}")
+        except Exception as e:
+            print(f"Binance {symbol} {url} error {e}")
+            continue
+    
+    # Fallback: Bybit
     try:
-        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1d&limit=250"
+        url = f"https://api.bybit.com/v5/market/kline?category=spot&symbol={symbol}&interval=D&limit=250"
         resp = requests.get(url, timeout=15)
-        data = resp.json()
-        closes = [float(k[4]) for k in data]
-        return closes
+        j = resp.json()
+        if j.get('result', {}).get('list'):
+            klines = j['result']['list'][::-1]  # bybit는 최신이 먼저 옴, 뒤집기
+            closes = [float(k[4]) for k in klines]
+            print(f"{symbol} from Bybit ok {len(closes)}")
+            return closes
     except Exception as e:
-        print(f"Binance {symbol} error {e}")
-        return []
+        print(f"Bybit {symbol} error {e}")
+    
+    return []
 
 def sma(data, period):
     if len(data) < period:
         return None
     return sum(data[-period:]) / period
-
-def ema(data, period):
-    if len(data) < period:
-        return None
-    k = 2/(period+1)
-    ema_val = sum(data[:period]) / period
-    for price in data[period:]:
-        ema_val = price * k + ema_val * (1-k)
-    return ema_val
 
 def rsi(data, period=14):
     if len(data) < period+1:
@@ -91,20 +107,17 @@ def check_ticker_simple(closes, ticker="005930"):
     if not ma200 or not ma20 or not ma50:
         return None
     
-    # BSE simplified
     rsi_score = 100 - rsi_last
     disp = (close - ma200)/ma200*100
     disp_score = max(0, min(100, -disp*4+30))
     bb_score = 85 if rsi_last < 30 else 60 if rsi_last < 40 else 35
     tech = rsi_score*0.5 + disp_score*0.3 + bb_score*0.2
-    bse = tech*0.6 + 70*0.4  # simplified valuation 70
+    bse = tech*0.6 + 70*0.4
     
-    # TAF P1 check - Higher Low + breakout approximation
-    # 최근 20일 저점 vs 이전 20일 저점
     recent_lows = closes[-20:]
     prev_lows = closes[-40:-20]
     higher_low = min(recent_lows) > min(prev_lows)
-    breakout = close > max(closes[-40:-5])  # 최근 고점 돌파
+    breakout = close > max(closes[-40:-5])
     momentum = close > ma20 and ma20 > ma50
     
     taf = "P1" if (higher_low and breakout and momentum) else "P0"
@@ -135,6 +148,7 @@ def monitor():
                 closes = get_binance_close(s)
                 res = check_ticker_simple(closes, s)
                 if not res:
+                    print(f"{s} no data")
                     continue
                 print(f"{s} BSE:{res['bse']:.1f} TAF:{res['taf']} LONG:{res['long']}")
                 if res['long']:
@@ -146,6 +160,7 @@ def monitor():
             time.sleep(3600)
         except Exception as e:
             print(f"monitor error {e}")
+            import traceback; traceback.print_exc()
             time.sleep(300)
 
 @app.route("/")
@@ -154,7 +169,7 @@ def home():
 
 @app.route("/test_telegram")
 def test_telegram():
-    send_telegram("✅ TAFKIS 직접감시 연결 성공!\n\nTradingView 없이 서버가 직접 BSE 70+PI 감시 중\n종목: 005930, SOLUSDT, BTCUSDT\n1시간마다 체크")
+    send_telegram("✅ TAFKIS 직접감시 연결 성공!\n\nBSE 70+PI 감시 중\n종목: 005930, SOLUSDT, BTCUSDT\n1시간마다 체크")
     return f"전송 성공 to {CHAT_ID}"
 
 @app.route("/check_now")
@@ -163,11 +178,11 @@ def check_now():
     for t in WATCHLIST_KRX:
         c=get_krx_close(t)
         r=check_ticker_simple(c,t)
-        out.append(f"{t}: BSE {r['bse']:.1f} TAF {r['taf']} LONG {r['long']} Close {r['close']}" if r else f"{t}: fail")
+        out.append(f"{t}: BSE {r['bse']:.1f} TAF {r['taf']} LONG {r['long']} Close {r['close']}" if r else f"{t}: fail (len={len(c)})")
     for s in WATCHLIST_CRYPTO:
         c=get_binance_close(s)
         r=check_ticker_simple(c,s)
-        out.append(f"{s}: BSE {r['bse']:.1f} TAF {r['taf']} LONG {r['long']} Close ${r['close']:.2f}" if r else f"{s}: fail")
+        out.append(f"{s}: BSE {r['bse']:.1f} TAF {r['taf']} LONG {r['long']} Close ${r['close']:.2f} len={len(c)}" if r else f"{s}: fail len={len(c)}")
     return "<br>".join(out)
 
 threading.Thread(target=monitor, daemon=True).start()
