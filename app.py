@@ -1,95 +1,79 @@
-from flask import Flask, request, jsonify
-import requests, json, datetime, os
+import os
+import imaplib
+import email
+import threading
+import time
+from flask import Flask, request
+import requests
 
 app = Flask(__name__)
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8886231117:AAH2FZtC57YuvcVhljiDKaJxTDY7xGzWEeg")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "384241591")
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+GMAIL_USER = os.getenv("GMAIL_USER")
+GMAIL_APP_PASS = os.getenv("GMAIL_APP_PASS")
 
-LOG_FILE = "taf_alerts.jsonl"
-
-def send_telegram(msg, chat_id=None):
-    target = chat_id or TELEGRAM_CHAT_ID
-    if not target:
-        print("No chat ID")
-        return False
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": target, "text": msg, "parse_mode": "Markdown"}
+def send_telegram(text):
+    if not BOT_TOKEN or not CHAT_ID:
+        return
     try:
-        r = requests.post(url, json=payload, timeout=15)
-        print(f"TG {r.status_code}: {r.text[:300]}")
-        return r.ok
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        requests.post(url, json={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=10)
     except Exception as e:
-        print(f"TG error {e}")
-        return False
-
-@app.route("/webhook/taf", methods=["POST"])
-def taf_webhook():
-    raw = request.get_data(as_text=True)
-    try:
-        j = request.get_json(force=True) or {}
-    except:
-        j = {"raw": raw}
-    
-    ticker = j.get("ticker", "KRX:005930")
-    bse = j.get("bse", j.get("close", ""))
-    per = j.get("per", "")
-    pbr = j.get("pbr", "")
-    taf = j.get("taf", "P1")
-    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(json.dumps({"time": now, "data": j}, ensure_ascii=False) + "\n")
-    
-    per_score = 0
-    try:
-        per_score = (12 - float(per)) * 12 if per else 0
-    except:
-        pass
-    
-    msg = f"""🚀 *TAF LONG 알림*
-
-종목: {ticker}
-시간: {now}
-BSE: {bse} (70+ PASS ✅)
-PER: {per} → Score {per_score:.0f}
-PBR: {pbr}
-TAF: {taf} = LONG
-False 41%→25% 필터 통과
-Formula: (12-PER)*12 / (1.5-PBR)*100
-"""
-    send_telegram(msg)
-    return jsonify({"status": "ok", "ticker": ticker})
-
-@app.route("/test_telegram")
-def test_tg():
-    chat_id = request.args.get("chat_id", TELEGRAM_CHAT_ID)
-    msg = """✅ *TAFKIS_bot 연결 성공!*
-
-이제 TradingView에서 BSE 70+P1 LONG 뜨면
-이 채팅방으로 바로 알림 올 거야.
-
-테스트 완료 - 서버 정상 작동 중
-"""
-    ok = send_telegram(msg, chat_id)
-    return f"<h2>{'✅ 전송 성공' if ok else '❌ 전송 실패'} to {chat_id}</h2><br><pre>{msg}</pre>"
+        print(f"Telegram error: {e}")
 
 @app.route("/")
 def home():
-    return f"""
-    <h1>TAF v4 Webhook Server</h1>
-    <p>Bot: @TAFKIS_bot</p>
-    <p>Chat ID: {TELEGRAM_CHAT_ID} (숨김 처리됨)</p>
-    <ul>
-        <li>POST /webhook/taf - TradingView 웹훅 받기</li>
-        <li>GET /test_telegram - 테스트 메시지 보내기</li>
-    </ul>
-    <p><a href='/test_telegram'>테스트 보내기 클릭</a></p>
-    <hr>
-    <p>TradingView 알림 Webhook URL:</p>
-    <code>https://YOUR-URL.up.railway.app/webhook/taf</code>
-    """
+    return "TAFKIS Email->Telegram Bot Running"
+
+@app.route("/test_telegram")
+def test_telegram():
+    send_telegram("TAFKIS.bot 연결 성공!\n\n이제 TradingView에서 BSE 70+PI LONG 뜨면 이 채팅방으로 바로 알림 올 거야.\n\n테스트 완료 - 서버 정상 작동 중")
+    return f"전송 성공 to {CHAT_ID}"
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    data = request.json
+    send_telegram(f"TradingView Webhook\n{data}")
+    return "ok"
+
+def check_gmail():
+    while True:
+        try:
+            if not GMAIL_USER or not GMAIL_APP_PASS:
+                time.sleep(30)
+                continue
+            mail = imaplib.IMAP4_SSL("imap.gmail.com")
+            mail.login(GMAIL_USER, GMAIL_APP_PASS)
+            mail.select("INBOX")
+            _, data = mail.search(None, '(UNSEEN FROM "TradingView")')
+            for num in data[0].split():
+                _, msg_data = mail.fetch(num, "(RFC822)")
+                msg = email.message_from_bytes(msg_data[0][1])
+                subject = msg["Subject"] or ""
+                body = ""
+                if msg.is_multipart():
+                    for part in msg.walk():
+                        if part.get_content_type() == "text/plain":
+                            payload = part.get_payload(decode=True)
+                            if payload:
+                                body = payload.decode(errors="ignore")
+                            break
+                else:
+                    payload = msg.get_payload(decode=True)
+                    if payload:
+                        body = payload.decode(errors="ignore")
+                text = f"{subject}\n{body}"
+                side = "BUY" if "LONG" in text.upper() or "BUY" in text.upper() else "SELL" if "SHORT" in text.upper() else "ALERT"
+                send_telegram(f"TAFKIS BSE 알림 [{side}]\n\n{subject}\n\n{body[:500]}")
+                mail.store(num, '+FLAGS', '\\Seen')
+            mail.logout()
+        except Exception as e:
+            print(f"Gmail check error: {e}")
+        time.sleep(30)
+
+threading.Thread(target=check_gmail, daemon=True).start()
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 5000))
+    port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
